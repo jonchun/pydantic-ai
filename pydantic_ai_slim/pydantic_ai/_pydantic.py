@@ -6,9 +6,10 @@ This module has to use numerous internal Pydantic APIs and is therefore brittle 
 from __future__ import annotations as _annotations
 
 from inspect import Parameter, signature
-from typing import TYPE_CHECKING, Any, Callable, TypedDict, cast, get_origin
+from typing import TYPE_CHECKING, Annotated, Any, Callable, TypedDict, cast, get_origin
 
-from pydantic import ConfigDict
+from mcp import Tool as MCPTool
+from pydantic import ConfigDict, WithJsonSchema
 from pydantic._internal import _decorators, _generate_schema, _typing_extra
 from pydantic._internal._config import ConfigWrapper
 from pydantic.fields import FieldInfo
@@ -171,6 +172,71 @@ def function_schema(  # noqa: C901
     )
 
 
+def mcp_function_schema(
+    mcp_tool: MCPTool,
+) -> FunctionSchema:
+    config = ConfigDict(title=mcp_tool.name)
+    config_wrapper = ConfigWrapper(config)
+    gen_schema = _generate_schema.GenerateSchema(config_wrapper)
+    var_kwargs_schema: core_schema.CoreSchema | None = None
+    fields: dict[str, core_schema.TypedDictField] = {}
+    positional_fields: list[str] = []
+    var_positional_field: str | None = None
+    errors: list[str] = []
+    decorators = _decorators.DecoratorInfos()
+
+    schema = mcp_tool.inputSchema
+    if schema.get('type') != 'object':
+        raise ValueError('Only object types are supported')
+
+    properties: dict[str, Any] = schema.get('properties', {})
+    required = schema.get('required', [])
+
+    field_schema: dict[str, Any]
+    for field_name, field_schema in properties.items():
+        try:
+            field_type = _json_type_to_python(field_schema.get('type', 'string'))
+        except KeyError:
+            errors.append(f"Unknown JSON type: {field_schema.get('type', None)}")
+            continue
+        annotation = cast(type[Any], Annotated[field_type, WithJsonSchema(field_schema)])
+
+        fields[field_name] = td_schema = gen_schema._generate_td_field_schema(  # pyright: ignore[reportPrivateUsage]
+            field_name,
+            FieldInfo.from_annotation(annotation),
+            decorators,
+            required=field_name in required,
+        )
+        td_schema.setdefault('metadata', {})['is_model_like'] = is_model_like(annotation)
+    if errors:
+        from pydantic_ai.exceptions import UserError
+
+        error_details = '\n  '.join(errors)
+        raise UserError(f'Error generating schema for {mcp_tool}:\n  {error_details}')
+
+    core_config = config_wrapper.core_config(None)
+    # noinspection PyTypedDict
+    core_config['extra_fields_behavior'] = 'allow' if var_kwargs_schema else 'forbid'
+
+    schema, single_arg_name = _build_schema(
+        fields,
+        var_kwargs_schema,
+        gen_schema,
+        core_config,
+    )
+    schema = gen_schema.clean_schema(schema)
+    schema_validator = SchemaValidator(schema, core_config)
+
+    return FunctionSchema(
+        description=mcp_tool.description or '',
+        validator=schema_validator,
+        json_schema=mcp_tool.inputSchema,
+        single_arg_name=single_arg_name,
+        positional_fields=positional_fields,
+        var_positional_field=var_positional_field,
+    )
+
+
 def takes_ctx(function: Callable[..., Any]) -> bool:
     """Check if a function takes a `RunContext` first argument.
 
@@ -228,3 +294,19 @@ def _is_call_ctx(annotation: Any) -> bool:
     return annotation is RunContext or (
         _typing_extra.is_generic_alias(annotation) and get_origin(annotation) is RunContext
     )
+
+
+_type_map = {
+    'array': list,
+    'string': str,
+    'number': float,
+    'integer': int,
+    'boolean': bool,
+    'object': dict,
+    'null': type(None),
+}
+
+
+def _json_type_to_python(json_type: str):
+    """Maps JSON Schema types to Python types, considering formats."""
+    return _type_map[json_type]

@@ -6,6 +6,7 @@ from collections.abc import Awaitable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Generic, Literal, Union, cast
 
+from mcp import ClientSession
 from pydantic import ValidationError
 from pydantic_core import SchemaValidator
 from typing_extensions import Concatenate, ParamSpec, TypeAlias, TypeVar
@@ -332,6 +333,34 @@ class Tool(Generic[AgentDepsT]):
                 content=content,
                 tool_call_id=call_message.tool_call_id,
             )
+
+    @staticmethod
+    async def list_from_mcp(session: ClientSession) -> list[Tool[AgentDepsT]]:
+        tools: list[Tool[AgentDepsT]] = []
+        session_tools = await session.list_tools()
+
+        for mcp_tool in session_tools.tools:
+
+            async def _tool(**kwargs: dict[str, Any]) -> Any:
+                res = await session.call_tool(mcp_tool.name, kwargs)  # type: ignore
+                if res.isError:
+                    raise ValueError('Tool call failed')
+                for c in res.content:
+                    if c.type == 'text':
+                        return c.text
+                raise ValueError('No text content')
+
+            tools.append(
+                Tool[AgentDepsT](
+                    function=_tool,
+                    name=mcp_tool.name,
+                    description=mcp_tool.description,
+                    takes_ctx=False,
+                    max_retries=None,
+                    function_schema=_pydantic.mcp_function_schema(mcp_tool),
+                )
+            )
+        return tools
 
 
 ObjectJsonSchema: TypeAlias = dict[str, Any]
